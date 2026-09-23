@@ -233,10 +233,28 @@ input, select {
       <div id="app"></div>
     </main>
   </div>
+
+  <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-compat.js"></script>
   <script src="https://checkout.flutterwave.com/v3.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
   <script>
-const STORAGE_KEY = "dechematos-v13";
+const firebaseConfig = {
+  apiKey: "AIzaSyBMHnG7sCUx_K2dOT7IxwETd7T_HxhLmtU",
+  authDomain: "de-chematos-class-27.firebaseapp.com",
+  projectId: "de-chematos-class-27",
+  storageBucket: "de-chematos-class-27.firebasestorage.app",
+  messagingSenderId: "520285358696",
+  appId: "1:520285358696:web:e3e0b26333f75837bfc9dd",
+  measurementId: "G-8ENM8VRJSF"
+};
+try {
+  firebase.initializeApp(firebaseConfig);
+} catch (e) {
+  console.error("Firebase init error", e);
+}
+
+const STORAGE_KEY = "dechematos-v14";
 
 const DEFAULT_STATE = {
   settings: {
@@ -487,6 +505,13 @@ function clearPendingIntent() {
   try { sessionStorage.removeItem("dechematos_pending_pay"); } catch (e) {}
 }
 
+function cloudDb() {
+  try {
+    if (typeof firebase !== "undefined" && firebase.firestore) return firebase.firestore();
+  } catch (e) {}
+  return null;
+}
+
 function recordConfirmedVote(state, vote) {
   if (!vote || !vote.nomineeId) return false;
   if (!state.votes) state.votes = [];
@@ -495,7 +520,7 @@ function recordConfirmedVote(state, vote) {
     return v.txId === txId && v.status === "confirmed";
   })) return false;
 
-  state.votes.push({
+  var voteRecord = {
     id: vote.id || uid("VT"),
     nomineeId: vote.nomineeId,
     nomineeName: vote.nomineeName || "",
@@ -508,8 +533,17 @@ function recordConfirmedVote(state, vote) {
     txId: txId || uid("TX"),
     status: "confirmed",
     at: vote.at || new Date().toISOString()
-  });
+  };
+
+  state.votes.push(voteRecord);
   saveState(state);
+
+  var db = cloudDb();
+  if (db) {
+    db.collection("votes").doc(voteRecord.id).set(voteRecord).catch(function (e) {
+      console.error("Cloud vote save error:", e);
+    });
+  }
   return true;
 }
 
@@ -534,6 +568,12 @@ function recordConfirmedTicket(state, ticket) {
   };
   state.purchases.push(row);
   saveState(state);
+  var db = cloudDb();
+  if (db) {
+    db.collection("tickets").doc(row.id).set(row).catch(function (e) {
+      console.error("Cloud ticket save error:", e);
+    });
+  }
   return row;
 }
 
@@ -607,9 +647,6 @@ function startPayment(opts) {
     pending.status = "successful";
     pending.flw = payment || {};
     pending.confirmedAt = new Date().toISOString();
-    if (payment && (payment.transaction_id || payment.id)) {
-      pending.flwId = payment.transaction_id || payment.id;
-    }
     saveState(state);
     clearPendingIntent();
     onSuccess(pending);
@@ -649,19 +686,10 @@ function startPayment(opts) {
           description: String(description || "Payment").slice(0, 100)
         },
         callback: function (payment) {
-          // Reload state in case another tab wrote
-          try { state = loadState(); } catch (e) {}
-          // Re-find pending by tx_ref
-          var p2 = (state.transactions || []).find(function (t) { return t.id === tx_ref; }) || pending;
           if (isFlutterwaveSuccess(payment)) {
-            p2.status = "successful";
-            p2.flw = payment || {};
-            p2.confirmedAt = new Date().toISOString();
-            saveState(state);
-            clearPendingIntent();
-            onSuccess(p2);
+            finishSuccess(payment);
           } else {
-            p2.status = (payment && payment.status) || "failed";
+            pending.status = (payment && payment.status) || "failed";
             saveState(state);
             clearPendingIntent();
             alert("Payment was not confirmed. Vote was not counted.");
@@ -737,6 +765,53 @@ function busyClick(btn, fn) {
   }
 }
 
+
+
+function mergeCloudVote(data) {
+  if (!data || !data.id) return false;
+  if (!state.votes) state.votes = [];
+  const exists = state.votes.some(v =>
+    v.id === data.id || (data.txId && v.txId === data.txId && v.status === "confirmed")
+  );
+  if (exists) return false;
+  state.votes.push(data);
+  return true;
+}
+
+function refreshAdminIfOpen() {
+  if (!location.hash.includes("admin")) return;
+  if (typeof paintAdmin === "function" && $("adminBox")) {
+    try { paintAdmin(); } catch (e) {}
+  }
+}
+
+function initRealtimeCloudSync() {
+  try {
+    if (typeof firebase === "undefined" || !firebase.firestore) {
+      console.warn("Firebase not loaded — votes stay on this device only.");
+      return;
+    }
+    const db = firebase.firestore();
+    db.collection("votes").onSnapshot(function (snapshot) {
+      let changed = false;
+      snapshot.docChanges().forEach(function (change) {
+        const data = change.doc.data();
+        if (!data) return;
+        if (change.type === "added" || change.type === "modified") {
+          if (mergeCloudVote(data)) changed = true;
+        }
+      });
+      if (changed) {
+        saveState(state);
+        refreshAdminIfOpen();
+      }
+    }, function (err) {
+      console.error("Firestore sync error:", err);
+    });
+  } catch (e) {
+    console.error("initRealtimeCloudSync failed:", e);
+  }
+}
 
 function closeMenu() {
   document.body.classList.remove("nav-open");
@@ -1981,6 +2056,7 @@ window.addEventListener("hashchange", route);
 window.addEventListener("DOMContentLoaded", () => {
   layoutShell();
   route();
+  initRealtimeCloudSync();
   setInterval(tick, 1000);
 });
 
