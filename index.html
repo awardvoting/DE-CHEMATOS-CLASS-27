@@ -236,7 +236,7 @@ input, select {
   <script src="https://checkout.flutterwave.com/v3.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
   <script>
-const STORAGE_KEY = "dechematos-v12";
+const STORAGE_KEY = "dechematos-v13";
 
 const DEFAULT_STATE = {
   settings: {
@@ -471,8 +471,9 @@ function flattenMeta(meta) {
 
 function isFlutterwaveSuccess(payment) {
   if (!payment) return false;
-  var s = String(payment.status || "").toLowerCase();
-  if (s === "successful" || s === "completed" || s === "success") return true;
+  var status = String(payment.status || "").toLowerCase();
+  if (status === "successful" || status === "completed" || status === "success") return true;
+  if (status === "approved" || status === "settled") return true;
   var code = String(payment.charge_response_code || payment.chargeResponseCode || "");
   if (code === "00" || code === "0") return true;
   return false;
@@ -482,34 +483,29 @@ function savePendingIntent(intent) {
   try { sessionStorage.setItem("dechematos_pending_pay", JSON.stringify(intent)); } catch (e) {}
 }
 
-function loadPendingIntent() {
-  try {
-    var raw = sessionStorage.getItem("dechematos_pending_pay");
-    return raw ? JSON.parse(raw) : null;
-  } catch (e) { return null; }
-}
-
 function clearPendingIntent() {
   try { sessionStorage.removeItem("dechematos_pending_pay"); } catch (e) {}
 }
 
 function recordConfirmedVote(state, vote) {
   if (!vote || !vote.nomineeId) return false;
-  var txId = vote.txId || "";
+  if (!state.votes) state.votes = [];
+  var txId = String(vote.txId || "").trim();
   if (txId && state.votes.some(function (v) {
     return v.txId === txId && v.status === "confirmed";
   })) return false;
+
   state.votes.push({
     id: vote.id || uid("VT"),
     nomineeId: vote.nomineeId,
     nomineeName: vote.nomineeName || "",
     category: vote.category || "",
-    units: Number(vote.units) || 1,
-    amount: Number(vote.amount) || 0,
-    voter: vote.voter || "",
+    units: Math.max(1, parseInt(vote.units, 10) || 1),
+    amount: parseInt(vote.amount, 10) || 0,
+    voter: vote.voter || "Anonymous",
     email: vote.email || "",
     phone: vote.phone || "",
-    txId: txId,
+    txId: txId || uid("TX"),
     status: "confirmed",
     at: vote.at || new Date().toISOString()
   });
@@ -519,7 +515,8 @@ function recordConfirmedVote(state, vote) {
 
 function recordConfirmedTicket(state, ticket) {
   if (!ticket) return null;
-  var txId = ticket.txId || "";
+  if (!state.purchases) state.purchases = [];
+  var txId = String(ticket.txId || "").trim();
   if (txId) {
     var existing = state.purchases.find(function (t) { return t.txId === txId; });
     if (existing) return existing;
@@ -528,10 +525,10 @@ function recordConfirmedTicket(state, ticket) {
     id: ticket.id || uid("TKT"),
     tier: ticket.tier || "",
     price: Number(ticket.price) || 0,
-    name: ticket.name || "",
+    name: ticket.name || "Guest",
     email: ticket.email || "",
     phone: ticket.phone || "",
-    txId: txId,
+    txId: txId || uid("TX"),
     used: false,
     at: ticket.at || new Date().toISOString()
   };
@@ -543,11 +540,12 @@ function recordConfirmedTicket(state, ticket) {
 function startPayment(opts) {
   var state = opts.state;
   var amount = opts.amount;
-  var customer = opts.customer;
+  var customer = opts.customer || {};
   var meta = opts.meta;
   var description = opts.description;
   var onSuccess = opts.onSuccess;
   var onCancel = opts.onCancel;
+  var anonymous = !!opts.anonymous;
 
   var naira = Math.round(Number(amount));
   if (!naira || naira < 1) {
@@ -555,20 +553,29 @@ function startPayment(opts) {
     if (onCancel) onCancel();
     return;
   }
-  if (!customer || !String(customer.name || "").trim()) {
-    alert("Enter your full name.");
-    if (onCancel) onCancel();
-    return;
-  }
-  if (!isValidEmail(customer.email)) {
-    alert("Enter a valid email (e.g. name@gmail.com).");
-    if (onCancel) onCancel();
-    return;
-  }
 
   var tx_ref = uid("TX").replace(/[^a-zA-Z0-9\-]/g, "");
-  var flatMeta = flattenMeta(meta);
 
+  if (anonymous) {
+    customer = {
+      name: "Anonymous Voter",
+      email: "vote." + tx_ref.toLowerCase().replace(/[^a-z0-9]/g, "") + "@gmail.com",
+      phone: "08000000000"
+    };
+  } else {
+    if (!customer || !String(customer.name || "").trim()) {
+      alert("Enter your full name.");
+      if (onCancel) onCancel();
+      return;
+    }
+    if (!isValidEmail(customer.email)) {
+      alert("Enter a valid email (e.g. name@gmail.com).");
+      if (onCancel) onCancel();
+      return;
+    }
+  }
+
+  var flatMeta = flattenMeta(meta);
   savePendingIntent({
     tx_ref: tx_ref,
     amount: naira,
@@ -592,6 +599,7 @@ function startPayment(opts) {
     status: "pending",
     createdAt: new Date().toISOString()
   };
+  if (!state.transactions) state.transactions = [];
   state.transactions.push(pending);
   saveState(state);
 
@@ -599,6 +607,9 @@ function startPayment(opts) {
     pending.status = "successful";
     pending.flw = payment || {};
     pending.confirmedAt = new Date().toISOString();
+    if (payment && (payment.transaction_id || payment.id)) {
+      pending.flwId = payment.transaction_id || payment.id;
+    }
     saveState(state);
     clearPendingIntent();
     onSuccess(pending);
@@ -617,7 +628,7 @@ function startPayment(opts) {
   waitForFlutterwave(5000).then(function (ready) {
     if (!ready || !canUseLiveFlutterwave(state)) {
       clearPendingIntent();
-      alert("Flutterwave could not start.\nScript: " + (flutterwaveReady() ? "loaded" : "NOT loaded") + "\nKey: " + (getFlutterwaveKey(state) ? getFlutterwaveKey(state).slice(0, 16) + "…" : "missing"));
+      alert("Flutterwave could not start. Check internet and try again.");
       if (onCancel) onCancel();
       return;
     }
@@ -638,13 +649,22 @@ function startPayment(opts) {
           description: String(description || "Payment").slice(0, 100)
         },
         callback: function (payment) {
+          // Reload state in case another tab wrote
+          try { state = loadState(); } catch (e) {}
+          // Re-find pending by tx_ref
+          var p2 = (state.transactions || []).find(function (t) { return t.id === tx_ref; }) || pending;
           if (isFlutterwaveSuccess(payment)) {
-            finishSuccess(payment);
-          } else {
-            pending.status = (payment && payment.status) || "failed";
+            p2.status = "successful";
+            p2.flw = payment || {};
+            p2.confirmedAt = new Date().toISOString();
             saveState(state);
             clearPendingIntent();
-            alert("Payment was not confirmed. Vote/ticket was not issued.");
+            onSuccess(p2);
+          } else {
+            p2.status = (payment && payment.status) || "failed";
+            saveState(state);
+            clearPendingIntent();
+            alert("Payment was not confirmed. Vote was not counted.");
             if (onCancel) onCancel();
           }
         },
@@ -912,23 +932,19 @@ function openVoteModal(id) {
   if (!selectedNominee) return;
   $("overlay").innerHTML = `
     <div class="modal">
-      <button class="x" onclick="closeModal()">×</button>
+      <button class="x" type="button" id="closeVoteModal">×</button>
       <p class="eyebrow">Pay to vote</p>
       <h2>${selectedNominee.name}</h2>
       <p class="muted">${selectedNominee.category}</p>
       <label>How many votes</label>
       <input id="voteUnits" type="number" min="1" max="${state.settings.maxVotesPerPurchase}" value="1" />
-      <label>Your full name</label>
-      <input id="voterName" placeholder="Your name" />
-      <label>Email</label>
-      <input id="voterEmail" type="email" placeholder="you@email.com" />
-      <label>Phone</label>
-      <input id="voterPhone" placeholder="080..." />
       <p id="voteTotal" class="total">${money(state.settings.votePrice)}</p>
+      <p class="muted" style="font-size:12px;margin-top:8px">No name or contact needed. Pay to confirm your votes.</p>
       <button class="gold full" type="button" id="payVotesBtn">Pay with Flutterwave</button>
     </div>
   `;
   $("overlay").className = "overlay open";
+  $("closeVoteModal").onclick = closeModal;
   $("voteUnits").oninput = () => {
     const units = clampUnits($("voteUnits").value);
     $("voteTotal").textContent = money(units * state.settings.votePrice);
@@ -943,16 +959,8 @@ function clampUnits(v) {
 function payForVotes() {
   const btn = $("payVotesBtn");
   if (btn && btn.disabled) return;
+  if (!selectedNominee) return alert("Pick a contestant again.");
   const units = clampUnits($("voteUnits").value);
-  const customer = {
-    name: $("voterName").value.trim(),
-    email: $("voterEmail").value.trim(),
-    phone: $("voterPhone").value.trim()
-  };
-  if (!customer.name) return alert("Enter your full name.");
-  if (!customer.email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(customer.email)) {
-    return alert("Enter a valid email (e.g. name@gmail.com).");
-  }
   const amount = Math.round(units * Number(state.settings.votePrice));
   if (amount < 1) return alert("Invalid vote amount.");
   const nomineeSnapshot = {
@@ -964,7 +972,8 @@ function payForVotes() {
   startPayment({
     state,
     amount,
-    customer,
+    anonymous: true,
+    customer: { name: "Anonymous Voter", email: "anon@gmail.com", phone: "08000000000" },
     description: units + " vote(s) for " + nomineeSnapshot.name,
     meta: {
       type: "vote",
@@ -974,22 +983,26 @@ function payForVotes() {
       units: String(units)
     },
     onSuccess: (tx) => {
+      // Reload latest state from storage then record
+      try { state = loadState(); } catch (e) {}
       const added = recordConfirmedVote(state, {
         nomineeId: nomineeSnapshot.id,
         nomineeName: nomineeSnapshot.name,
         category: nomineeSnapshot.category,
         units,
         amount,
-        voter: customer.name,
-        email: customer.email,
-        phone: customer.phone,
+        voter: "Anonymous",
+        email: "",
+        phone: "",
         txId: tx.id
       });
+      // Sync global state after record
+      try { state = loadState(); } catch (e) {}
       closeModal();
       if (added) {
         alert("Payment confirmed. " + units + " vote(s) counted for " + nomineeSnapshot.name + ".");
       } else {
-        alert("Payment already recorded for this transaction.");
+        alert("This payment was already counted.");
       }
       const idx = state.categories.indexOf(nomineeSnapshot.category);
       if (idx >= 0) setView("category", String(idx));
@@ -1299,6 +1312,7 @@ let adminTab = "event";
 
 function paintAdmin() {
   if (!$("adminBox")) return;
+  try { state = loadState(); } catch (e) {}
   const tabs = [
     ["event", "Event"],
     ["contacts", "Contacts"],
@@ -1348,6 +1362,7 @@ function paintAdmin() {
 
 
 function adminVotesHTML() {
+  try { state = loadState(); } catch (e) {}
   const rows = state.votes
     .filter(v => v.status === "confirmed")
     .slice()
@@ -1399,6 +1414,7 @@ function adminRecoverVoteHTML() {
 }
 
 function adminBoardHTML() {
+  try { state = loadState(); } catch (e) {}
   return state.categories.map(cat => {
     const rows = tallyCategory(state, cat);
     if (!rows.length) return "";
